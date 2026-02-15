@@ -62,6 +62,7 @@ Quick Start
 from __future__ import annotations
 
 import typing
+import warnings
 from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
@@ -363,20 +364,26 @@ class ConfigurableModule:
         self._warned_messages: set[str] = set()
         self._config_output: ConfigList = ConfigList()
         if self.run_config_type is None:
-            self.warn_once(
+            warnings.warn(
                 f"Module {type(self)} has no run_config_type defined. "
-                "Cannot save calibration results."
+                "Cannot save calibration results.",
+                stacklevel=2,
             )
-
-    def _reset_skip_state_calibration(self) -> None:
+    def restart_config(self):
+        if self._config_index == 0:
+            assert not self._config_output
+            return
         self._config_index = 0
         self._config_output = ConfigList()
         if (
-           isinstance(self.config, CalibratedCalibConfig) 
-           or isinstance(self.config_all, ConfigList) 
+           isinstance(self.config, CalibratedCalibConfig)
+           or isinstance(self.config_all, ConfigList)
            and any(isinstance(c, CalibratedCalibConfig) for c in self.config_all)
         ):
-            raise RuntimeError("Using reset_skip_state() with a calibration config is not allowed. Most calibration results will be lost.")
+            warnings.warn(
+                "Using restart_config() with a calibration config; data will be lost.",
+                stacklevel=2,
+            )
 
     @property
     def module_name(self) -> str | None:
@@ -395,22 +402,29 @@ class ConfigurableModule:
         if self._instance_config is not None:
             # self._instance_config overrides registry config, but we warn about it
             if self._registry is None:
-                self.warn_once("Module has no registry. Using local config.")
+                warnings.warn(
+                    "Module has no registry. Using local config.", stacklevel=2
+                )
             elif self._registry_config is None:
-                self.warn_once("Module has no registry config. Using local config.")
+                warnings.warn(
+                    "Module has no registry config. Using local config.", stacklevel=2
+                )
             else:
-                self.warn_once(
+                warnings.warn(
                     "Module has both local config and registry config. "
-                    "Using local config."
+                    "Using local config.",
+                    stacklevel=2,
                 )
             return self._instance_config
         if self._registry is None:
-            self.warn_once(
-                "Module has no registry or local config. Using default config."
+            warnings.warn(
+                "Module has no registry or local config. Using default config.",
+                stacklevel=2,
             )
         elif self._registry_config is None:
-            self.warn_once(
-                "Module has no registry config or local config. Using default config."
+            warnings.warn(
+                "Module has no registry config or local config. Using default config.",
+                stacklevel=2,
             )
         else:
             return self._registry_config
@@ -435,13 +449,6 @@ class ConfigurableModule:
         else:
             return cfg
 
-    def warn_once(self, message: str) -> None:
-        """Log a warning message, but only once per unique message."""
-        if message not in self._warned_messages:
-            log = self.logger.bind(module_name=self.module_name)
-            log.warning(message)
-            self._warned_messages.add(message)
-
     def add_calibration_results(self, results: CalibratedRunConfig) -> None:
         """
         Record calibration results and advance the timestep index.
@@ -456,8 +463,8 @@ class ConfigurableModule:
         if self.run_config_type is None:
             return
         if self._registry is None and isinstance(self.config, CalibratedCalibConfig):
-            self.warn_once(
-                f"Module {id(self)} has no registry. Cannot save calibration results."
+            warnings.warn(
+                "Module has no registry. Cannot save calibration results.", stacklevel=2
             )
         if not isinstance(results, self.run_config_type):
             raise TypeError(

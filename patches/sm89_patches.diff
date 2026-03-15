@@ -1,0 +1,514 @@
+diff --git a/hopper/_internal/cpp/flash.h b/hopper/_internal/cpp/flash.h
+index 6fc695e..12bb3d0 100644
+--- a/hopper/_internal/cpp/flash.h
++++ b/hopper/_internal/cpp/flash.h
+@@ -237,6 +237,10 @@ struct Flash_bwd_params : public Flash_fwd_params
+ 
+     bool deterministic;
+     index_t dq_accum_split_stride;
++
++    // Block sparsity mask for backward tile skipping
++    void const* __restrict__ block_mask_ptr = nullptr;
++    int block_mask_num_words = 0;  // int32 words per (bh, n_block) entry
+ };
+ 
+ ////////////////////////////////////////////////////////////////////////////////////////////////////
+diff --git a/hopper/_internal/cpp/flash_api.cpp b/hopper/_internal/cpp/flash_api.cpp
+index 73e179c..ee0a529 100644
+--- a/hopper/_internal/cpp/flash_api.cpp
++++ b/hopper/_internal/cpp/flash_api.cpp
+@@ -1490,7 +1490,8 @@
+      int64_t window_size_right,
+      double softcap,
+      bool deterministic,
+-     int64_t sm_margin
++     int64_t sm_margin,
++     std::optional<at::Tensor> block_mask_
+  ) {
+  
+      #ifdef FLASHATTENTION_DISABLE_BACKWARD
+@@ -1753,6 +1754,16 @@
+      TORCH_CHECK(params.softcap == 0.0, "This flash attention build does not support tanh softcapping.");
+      #endif
+  
++     // Set block sparsity mask if provided
++     if (block_mask_.has_value()) {
++         auto block_mask = block_mask_.value();
++         TORCH_CHECK(block_mask.dtype() == torch::kInt32, "block_mask must be int32");
++         TORCH_CHECK(block_mask.is_cuda(), "block_mask must be on CUDA");
++         params.block_mask_ptr = block_mask.data_ptr();
++         // block_mask shape: [B, H, N, num_words]
++         params.block_mask_num_words = block_mask.size(-1);
++     }
++
+      if (total_q > 0 && total_k > 0 && num_heads_k > 0) {
+          auto stream = at::cuda::getCurrentCUDAStream().stream();
+          run_mha_bwd(params, stream);
+@@ -1884,7 +1895,20 @@
+              static_cast<int64_t>(MmaPV_is_RS), static_cast<int64_t>(IntraWGOverlap)};
+  }
+  
+- TORCH_LIBRARY(lite_attention, m) {
++ // Wrapper function to expose tile_size_fwd_sm8x to Python
++// Returns [kBlockM, kBlockN, kNWarps, kStages, Q_in_regs]
++std::vector<int64_t> get_tile_size_fwd_sm8x(
++        bool sm86_or_89, int64_t headdim, int64_t headdim_v, bool is_causal, bool is_local,
++        int64_t element_size, bool paged_kv, bool varlen_and_split, bool softcap, bool append_kv) {
++    auto [kBlockM, kBlockN, kNWarps, kStages, Q_in_regs] = tile_size_fwd_sm8x(
++        sm86_or_89, static_cast<int>(headdim), static_cast<int>(headdim_v), is_causal, is_local,
++        static_cast<int>(element_size), paged_kv, varlen_and_split, softcap, append_kv);
++    return {static_cast<int64_t>(kBlockM), static_cast<int64_t>(kBlockN),
++            static_cast<int64_t>(kNWarps), static_cast<int64_t>(kStages),
++            static_cast<int64_t>(Q_in_regs)};
++}
++
++TORCH_LIBRARY(lite_attention, m) {
+      m.def("fwd("
+          "Tensor q,"
+          "Tensor k,"
+@@ -1950,7 +1974,8 @@
+          "int window_size_right = -1,"
+          "float softcap = 0.0,"
+          "bool deterministic = False,"
+-         "int sm_margin = 0) -> (Tensor(dq!), Tensor(dk!), Tensor(dv!), Tensor, Tensor, Tensor, Tensor, Tensor)");
++         "int sm_margin = 0,"
++         "Tensor? block_mask = None) -> (Tensor(dq!), Tensor(dk!), Tensor(dv!), Tensor, Tensor, Tensor, Tensor, Tensor)");
+      m.def("fwd_combine("
+          "Tensor out_partial,"
+          "Tensor lse_partial,"
+@@ -1992,6 +2017,17 @@
+          "bool softcap = False,"
+          "bool is_skipable = False,"
+          "bool is_int8 = False) -> int[]", &get_tile_size_fwd_sm90);
++     m.def("get_tile_size_fwd_sm8x("
++         "bool sm86_or_89,"
++         "int headdim,"
++         "int headdim_v,"
++         "bool is_causal,"
++         "bool is_local,"
++         "int element_size = 2,"
++         "bool paged_kv = False,"
++         "bool varlen_and_split = False,"
++         "bool softcap = False,"
++         "bool append_kv = False) -> int[]", &get_tile_size_fwd_sm8x);
+  }
+  
+  TORCH_LIBRARY_IMPL(lite_attention, CUDA, m) {
+diff --git a/hopper/_internal/cpp/flash_bwd_launch_template.h b/hopper/_internal/cpp/flash_bwd_launch_template.h
+index b6e8810..bb28034 100644
+--- a/hopper/_internal/cpp/flash_bwd_launch_template.h
++++ b/hopper/_internal/cpp/flash_bwd_launch_template.h
+@@ -131,7 +131,10 @@ void run_flash_bwd(Flash_bwd_params &params, cudaStream_t stream) {
+         params.b,
+         params.dq_semaphore,
+         params.cu_seqlens_q, params.cu_seqlens_k,
+-        params.seqused_q, params.seqused_k
++        params.seqused_q, params.seqused_k,
++        static_cast<uint32_t const*>(params.block_mask_ptr),
++        params.block_mask_num_words,
++        (params.block_mask_ptr != nullptr) ? cute::ceil_div(seqlen_k, kBlockN) : 0
+     };
+     // The case work with GQA is ugly but idk how to fix it.
+     typename CollectiveEpilogue::Arguments epilogue_args {
+diff --git a/hopper/_internal/cpp/mainloop_bwd_sm80.hpp b/hopper/_internal/cpp/mainloop_bwd_sm80.hpp
+index 23baae6..7581ba6 100644
+--- a/hopper/_internal/cpp/mainloop_bwd_sm80.hpp
++++ b/hopper/_internal/cpp/mainloop_bwd_sm80.hpp
+@@ -306,6 +306,10 @@ struct CollectiveMainloopBwdSm80 {
+         int const* const cu_seqlens_k = nullptr;
+         int const* const seqused_q = nullptr;
+         int const* const seqused_k = nullptr;
++        // Block sparsity mask for backward tile skipping
++        uint32_t const* const ptr_block_mask = nullptr;
++        int const num_mask_words = 0;  // words per (bh, n) entry; 0 = no mask
++        int const num_col_tiles = 0;
+     };
+ 
+     // Device side kernel params
+@@ -341,6 +345,10 @@ struct CollectiveMainloopBwdSm80 {
+         int const *const cu_seqlens_k = nullptr;
+         int const *const seqused_q = nullptr;
+         int const *const seqused_k = nullptr;
++        // Block sparsity mask for backward tile skipping
++        uint32_t const* const ptr_block_mask = nullptr;
++        int const num_mask_words = 0;
++        int const num_col_tiles = 0;
+     };
+ 
+     static Params
+@@ -370,7 +378,28 @@ struct CollectiveMainloopBwdSm80 {
+                 args.window_size_left, args.window_size_right, attention_chunk_divmod,
+                 !Has_softcap ? 0.f : args.softmax_scale / args.softcap_val,
+                 args.num_batch, args.dq_semaphore,
+-                args.cu_seqlens_q, args.cu_seqlens_k, args.seqused_q, args.seqused_k};
++                args.cu_seqlens_q, args.cu_seqlens_k, args.seqused_q, args.seqused_k,
++                args.ptr_block_mask, args.num_mask_words, args.num_col_tiles};
++    }
++
++
++    // ── Backward block-sparsity: inline bitmask check ──────────────────────
++    // Layout: ptr_block_mask[(bidb*H + bidh) * num_col_tiles * num_mask_words + n_block * num_mask_words + word]
++    // Bit (m % 32) of word (m / 32) is set iff Q-block m is active for this n_block.
++    CUTLASS_DEVICE static bool
++    is_m_block_active(Params const& params, int bidb, int bidh, int n_block, int m_block) {
++        if (params.ptr_block_mask == nullptr) return true;  // no mask = all active
++        int num_heads = get<2>(params.shape_Q);
++        int num_words = params.num_mask_words;
++        int num_cols  = params.num_col_tiles;
++        int word_idx  = m_block >> 5;   // m_block / 32
++        int bit_idx   = m_block & 31;   // m_block % 32
++        if (word_idx >= num_words) return true;  // safety: out of mask range = active
++        uint32_t const* base = params.ptr_block_mask
++            + (int64_t(bidb) * num_heads + bidh) * num_cols * num_words
++            + n_block * num_words;
++        uint32_t word = __ldg(base + word_idx);  // read-only L2 cache path
++        return (word >> bit_idx) & 1u;
+     }
+ 
+     template <typename SharedStorage, typename FrgTensordKV>
+@@ -880,6 +909,7 @@ struct CollectiveMainloopBwdSm80 {
+             int const m_block_masking_max = ((n_block + 1) * kBlockN - 1 + seqlen_q - seqlen_k - params.window_size_right) / kBlockM + 1;
+             CUTLASS_PRAGMA_NO_UNROLL
+             for (; m_block < std::min(m_block_max, m_block_masking_max); ++m_block) {
++                if (!is_m_block_active(params, bidb, bidh, n_block, m_block)) continue;
+                 bwd_step(m_block, mask_fn);
+             }
+         }
+@@ -892,6 +922,7 @@ struct CollectiveMainloopBwdSm80 {
+         auto mask_fn = [&](auto& tSrS, int m_block) { mask.template apply<true /*Seqlenk_mask*/, Is_causal && !SeparateMaskingIterations, Is_local && !SeparateMaskingIterations>(tSrS, m_block, n_block); };
+         CUTLASS_PRAGMA_NO_UNROLL
+         for (; m_block < m_block_max_before_local_mask; ++m_block) {
++            if (!is_m_block_active(params, bidb, bidh, n_block, m_block)) continue;
+             bwd_step(m_block, mask_fn);
+         }
+ 
+@@ -899,6 +930,7 @@ struct CollectiveMainloopBwdSm80 {
+             auto mask_fn = [&](auto& tSrS, int m_block) { mask.template apply<true /*Seqlenk_mask*/, false /*Causal_mask*/, Is_local>(tSrS, m_block, n_block); };
+             CUTLASS_PRAGMA_NO_UNROLL
+             for (; m_block < m_block_max; ++m_block) {
++                if (!is_m_block_active(params, bidb, bidh, n_block, m_block)) continue;
+                 bwd_step(m_block, mask_fn);
+             }
+         }
+diff --git a/hopper/_internal/cpp/mainloop_bwd_sm90_tma_gmma_ws.hpp b/hopper/_internal/cpp/mainloop_bwd_sm90_tma_gmma_ws.hpp
+index ec34e20..108aae9 100644
+--- a/hopper/_internal/cpp/mainloop_bwd_sm90_tma_gmma_ws.hpp
++++ b/hopper/_internal/cpp/mainloop_bwd_sm90_tma_gmma_ws.hpp
+@@ -320,6 +320,10 @@ struct CollectiveMainloopBwdSm90 {
+         int const* const cu_seqlens_k = nullptr;
+         int const* const seqused_q = nullptr;
+         int const* const seqused_k = nullptr;
++        // Block sparsity mask (unused on SM90 in this path, but needed for interface compat)
++        uint32_t const* const ptr_block_mask = nullptr;
++        int const num_mask_words = 0;
++        int const num_col_tiles = 0;
+     };
+ 
+     // Device side kernel params
+@@ -350,6 +354,9 @@ struct CollectiveMainloopBwdSm90 {
+         int const* const cu_seqlens_k = nullptr;
+         int const* const seqused_q = nullptr;
+         int const* const seqused_k = nullptr;
++        uint32_t const* const ptr_block_mask = nullptr;
++        int const num_mask_words = 0;
++        int const num_col_tiles = 0;
+     };
+ 
+     static Params
+@@ -406,7 +413,8 @@ struct CollectiveMainloopBwdSm90 {
+                 args.window_size_left, args.window_size_right, attention_chunk_divmod,
+                 !Has_softcap ? 0.f : args.softmax_scale / args.softcap_val,
+                 args.num_batch, args.dq_semaphore,
+-                args.cu_seqlens_q, args.cu_seqlens_k, args.seqused_q, args.seqused_k};
++                args.cu_seqlens_q, args.cu_seqlens_k, args.seqused_q, args.seqused_k,
++                args.ptr_block_mask, args.num_mask_words, args.num_col_tiles};
+     }
+ 
+     /// Issue Tma Descriptor Prefetch -- ideally from a single thread for best performance
+diff --git a/hopper/_internal/cpp/mainloop_fwd_sm80.hpp b/hopper/_internal/cpp/mainloop_fwd_sm80.hpp
+index 57b57da..f07c227 100644
+--- a/hopper/_internal/cpp/mainloop_fwd_sm80.hpp
++++ b/hopper/_internal/cpp/mainloop_fwd_sm80.hpp
+@@ -770,11 +770,13 @@ struct CollectiveMainloopFwdSm80 {
+             bool is_first_iter = true;
+             bool has_tiles = true;
+ 
+-            // Helper: get the first n_block to process within a range [start, end)
+-            // Forward (step=+1): start at start_idx
+-            // Backward (step=-1): start at end_idx - 1
+-            auto range_first = [](int start, int end) {
+-                return Phase ? start : end - 1;
++            // Helper: get the first n_block to process within a range.
++            // For Reverse=True reader, start_idx/end_idx are already adjusted by step:
++            //   Phase=True:  start_idx = low bound, end_idx = high bound (iterate forward)
++            //   Phase=False: start_idx = high bound, end_idx = low bound (iterate backward)
++            // In both cases, we start at start_idx.
++            auto range_first = [](int start, int /*end*/) {
++                return start;
+             };
+ 
+             // Start with the first range
+@@ -784,6 +786,12 @@ struct CollectiveMainloopFwdSm80 {
+             load_K(n_block, 0, cute::true_type{} /*Seqlenk_mask*/);
+             cute::cp_async_fence();
+ 
++            // Deferred range-end: must record AFTER fwd_step_skip processes the
++            // current tile's skip decision, otherwise the range-end marker goes
++            // into the writer before the tile's transition record.
++            bool pending_range_end = false;
++            int pending_range_end_idx = 0;
++
+             while (has_tiles) {
+                 // Process tiles within current range
+                 while (true) {
+@@ -793,8 +801,8 @@ struct CollectiveMainloopFwdSm80 {
+                         // Forward: at end when next would be >= end_idx
+                         at_range_end = (n_block + 1 >= skip_reader.end_idx);
+                     } else {
+-                        // Backward: at end when next would be < start_idx
+-                        at_range_end = (n_block - 1 < skip_reader.start_idx);
++                        // Backward: at end when next would be <= end_idx (lower bound)
++                        at_range_end = (n_block - 1 <= skip_reader.end_idx);
+                     }
+ 
+                     // Determine next tile
+@@ -806,10 +814,9 @@ struct CollectiveMainloopFwdSm80 {
+                     } else {
+                         // End of current range - check for more ranges
+                         if (skip_reader.has_more()) {
+-                            // Record range end for skip writer
+-                            if (thread_idx == 0) {
+-                                skip_writer.record_range_end(false, skip_reader.end_idx);
+-                            }
++                            // Defer range end until after fwd_step_skip
++                            pending_range_end = true;
++                            pending_range_end_idx = skip_reader.end_idx;
+                             skip_reader.load_range();
+                             skip_reader.advance();
+                             next_n_block = range_first(skip_reader.start_idx, skip_reader.end_idx);
+@@ -843,6 +850,13 @@ struct CollectiveMainloopFwdSm80 {
+                                       cute::bool_constant<Is_causal || Is_local>{}, skip_writer);
+                     }
+ 
++                    // Now record the deferred range end (after fwd_step_skip has
++                    // recorded the current tile's skip transition)
++                    if (pending_range_end && thread_idx == 0) {
++                        skip_writer.record_range_end(false, pending_range_end_idx);
++                        pending_range_end = false;
++                    }
++
+                     if (!has_next) {
+                         has_tiles = false;
+                         break;
+@@ -852,8 +866,9 @@ struct CollectiveMainloopFwdSm80 {
+                 }
+             }
+ 
+-            // Finalize skip writer
++            // Close the last range and finalize skip writer
+             if (thread_idx == 0) {
++                skip_writer.record_range_end(false, skip_reader.end_idx);
+                 skip_writer.finalize();
+             }
+         }
+diff --git a/hopper/_internal/flash_attn_interface.py b/hopper/_internal/flash_attn_interface.py
+index 6ae9350..a359477 100644
+--- a/hopper/_internal/flash_attn_interface.py
++++ b/hopper/_internal/flash_attn_interface.py
+@@ -140,6 +140,7 @@ def _flash_attn_backward(
+     softcap=0.0,
+     deterministic=False,
+     sm_margin=0,
++    block_mask=None,
+ ):
+     # dq, dk, dv are allocated by us so they should already be contiguous
+     dout, q, k, v, out = [maybe_contiguous(x) for x in (dout, q, k, v, out)]
+@@ -166,6 +167,7 @@ def _flash_attn_backward(
+         softcap,
+         deterministic,
+         sm_margin,
++        block_mask,
+     )
+     return dq, dk, dv, softmax_d
+ 
+@@ -326,6 +328,7 @@ class FlashAttnFunc(torch.autograd.Function):
+         return_softmax_lse=False,
+         reverse_skip_list=False,
+         phase=False,
++        bwd_block_mask=None,
+     ):
+         if softmax_scale is None:
+             softmax_scale = (q.shape[-1] + (qv.shape[-1] if qv is not None else 0)) ** (
+@@ -382,6 +385,8 @@ class FlashAttnFunc(torch.autograd.Function):
+         ctx.softcap = softcap
+         ctx.deterministic = deterministic
+         ctx.sm_margin = sm_margin
++        # Store backward block mask if provided (for tile skipping)
++        ctx.bwd_block_mask = bwd_block_mask
+         if return_softmax_lse:
+             return out, softmax_lse
+         else:
+@@ -392,6 +397,8 @@ class FlashAttnFunc(torch.autograd.Function):
+         q, k, v, out, softmax_lse = ctx.saved_tensors
+         assert ctx.attention_chunk == 0, "FA3 backward does not support attention_chunk"
+         dq, dk, dv = torch.empty_like(q), torch.empty_like(k), torch.empty_like(v)
++        # Get backward block mask if set on ctx
++        block_mask = getattr(ctx, 'bwd_block_mask', None)
+         _flash_attn_backward(
+             dout,
+             q,
+@@ -414,6 +421,7 @@ class FlashAttnFunc(torch.autograd.Function):
+             ctx.softcap,
+             ctx.deterministic,
+             ctx.sm_margin,
++            block_mask=block_mask,
+         )
+         dq = dq[..., : q.shape[-1]]  # We could have padded the head dimension
+         dk = dk[..., : k.shape[-1]]
+@@ -422,20 +430,28 @@ class FlashAttnFunc(torch.autograd.Function):
+             dq,
+             dk,
+             dv,
+-            None,
+-            None,
+-            None,
+-            None,
+-            None,
+-            None,
+-            None,
+-            None,
+-            None,
+-            None,
+-            None,
+-            None,
+-            None,
+-            None,
++            None,  # softmax_scale
++            None,  # causal
++            None,  # qv
++            None,  # q_descale
++            None,  # k_descale
++            None,  # v_descale
++            None,  # use_int8
++            None,  # window_size
++            None,  # attention_chunk
++            None,  # softcap
++            None,  # num_splits
++            None,  # pack_gqa
++            None,  # deterministic
++            None,  # sm_margin
++            None,  # attn_read_list
++            None,  # attn_must_do_list
++            None,  # attn_write_list
++            None,  # thr
++            None,  # return_softmax_lse
++            None,  # reverse_skip_list
++            None,  # phase
++            None,  # bwd_block_mask
+         )
+ 
+ 
+@@ -679,6 +695,7 @@ def flash_attn_func(
+     return_softmax_lse=False,
+     reverse_skip_list=False,
+     phase=False,
++    bwd_block_mask=None,
+ ):
+     """dropout_p should be set to 0.0 during evaluation
+     Supports multi-query and grouped-query attention (MQA/GQA) by passing in KV with fewer heads
+@@ -751,6 +768,7 @@ def flash_attn_func(
+         return_softmax_lse,
+         reverse_skip_list,
+         phase,
++        bwd_block_mask,
+     )
+ 
+ 
+diff --git a/hopper/lite_attention.py b/hopper/lite_attention.py
+index a5d15b9..c13e98d 100644
+--- a/hopper/lite_attention.py
++++ b/hopper/lite_attention.py
+@@ -346,14 +346,14 @@ class LiteAttention(nn.Module, ConfigurableModule):
+         for computation. Different head dimensions and data types require different
+         tile sizes for optimal performance.
+ 
+-        This function directly calls the C++ `tile_size_fwd_sm90()` function from
+-        `tile_size.h` to ensure consistency between Python and CUDA kernel tile sizes.
++        Automatically selects between SM90 and SM8x tile size functions based on
++        the current GPU's compute capability.
+ 
+         Args:
+             head_dim (int): Dimension of each attention head
+             dtype (torch.dtype): Data type of the tensors (fp16, bf16, fp32, int8)
+             v_colmajor (bool, optional): Whether value tensor is column-major. Defaults to False.
+-            is_int8 (bool, optional): Whether using int8 quantization. Defaults to False.
++            is_skipable (bool, optional): Whether skip list is active. Defaults to True.
+ 
+         Returns:
+             tuple[int, int]: (kBlockM, kBlockN) where:
+@@ -362,22 +362,20 @@ class LiteAttention(nn.Module, ConfigurableModule):
+         """
+         is_int8 = dtype == torch.int8
+         element_size = dtype.itemsize
+-        # Call C++ tile_size_fwd_sm90 function
+-        # Arguments: headdim, headdim_v, is_causal, is_local, element_size,
+-        #            v_colmajor, paged_kv_non_TMA, softcap, is_skipable, is_int8
+-        # Returns: [kBlockM, kBlockN, MmaPV_is_RS, IntraWGOverlap]
+-        result = _lite_attention_ops.get_tile_size_fwd_sm90(
+-            head_dim,  # headdim
+-            head_dim,  # headdim_v (same as headdim for standard attention)
+-            False,  # is_causal (not relevant for skipable case)
+-            False,  # is_local
+-            element_size,  # element_size (2 for fp16/bf16, 4 for fp32)
+-            v_colmajor,  # v_colmajor
+-            False,  # paged_kv_non_TMA
+-            False,  # softcap
+-            is_skipable,  # is_skipable
+-            is_int8,  # is_int8
+-        )
++        arch = torch.cuda.get_device_capability()
++        sm_version = arch[0] * 10 + arch[1]
++
++        if sm_version >= 90:
++            result = _lite_attention_ops.get_tile_size_fwd_sm90(
++                head_dim, head_dim, False, False, element_size,
++                v_colmajor, False, False, is_skipable, is_int8,
++            )
++        else:
++            sm86_or_89 = sm_version in (86, 89)
++            result = _lite_attention_ops.get_tile_size_fwd_sm8x(
++                sm86_or_89, head_dim, head_dim, False, False, element_size,
++                False, False, False, False,
++            )
+         kBlockM, kBlockN = result[0], result[1]
+         return kBlockM, kBlockN
+ 
+@@ -479,6 +477,11 @@ class LiteAttention(nn.Module, ConfigurableModule):
+                 ktiles
+             )
+ 
++            # Adjust boundaries by -1 to match the skip list format convention.
++            # The reader adds +step (±1) when loading ranges, so raw values must
++            # be offset by -1.  The normal "compute all" init stores [ktiles-1, -1]
++            # for the same reason.
++            tile_indices = [x - 1 for x in tile_indices]
+             tile_indices = [len(tile_indices)] + list(reversed(tile_indices))
+             skip_list[0, :, :, :, : len(tile_indices)] = torch.tensor(
+                 tile_indices, dtype=torch.int16, device=device
+diff --git a/setup.py b/setup.py
+index c305e7a..a567895 100644
+--- a/setup.py
++++ b/setup.py
+@@ -639,6 +639,12 @@ if not SKIP_CUDA_BUILD:
+         + (sources_bwd_sm80 if not DISABLE_SM8x else [])
+         + sources_bwd_sm90
+     )
++    # INT8 skipable SM90 instantiations (missing from auto-generation)
++    if not DISABLE_INT8:
++        sources += [
++            f"{SRC_DIR}/instantiations/flash_fwd_hdim{hdim}_int8_skipable_sm90.cu"
++            for hdim in HEAD_DIMENSIONS_FWD
++        ]
+     if not DISABLE_SPLIT:
+         sources += [f"{SRC_DIR}/_internal/cpp/flash_fwd_combine.cu"]
+     sources += [f"{SRC_DIR}/_internal/cpp/flash_prepare_scheduler.cu"]

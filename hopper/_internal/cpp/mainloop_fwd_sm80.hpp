@@ -17,6 +17,7 @@
 #include "pack_gqa.h"
 #include "paged_kv.h"
 #include "rotary.h"
+#include "skip_list.h"
 #include "utils.h"
 
 namespace flash {
@@ -25,7 +26,7 @@ using namespace cute;
 
 template <int kNWarps, int Stages, bool Q_in_regs, class TileShape_MNK_, int kHeadDimV, class Element_, class ElementAccum_, class ArchTag_,
         bool Is_causal_, bool Is_local_, bool Has_softcap_, bool Varlen_, bool PagedKV_, bool AppendKV_,
-        bool PackGQA_, bool Split_>
+        bool PackGQA_, bool Split_, bool Is_skipable_=false, bool ReverseSkipList_=false, bool Phase_=true, bool HasMustDoList_=false>
 struct CollectiveMainloopFwdSm80 {
 
     static constexpr int kStages = Stages;
@@ -45,6 +46,10 @@ struct CollectiveMainloopFwdSm80 {
     static constexpr bool PackGQA = PackGQA_;
     static constexpr bool Split = Split_;
     static constexpr bool Transpose_V = Is_FP8;
+    static constexpr bool Is_skipable = Is_skipable_;
+    static constexpr bool ReverseSkipList = ReverseSkipList_;
+    static constexpr bool Phase = Phase_;
+    static constexpr bool HasMustDoList = HasMustDoList_;
 
     static_assert(ArchTag::kMinComputeCapability >= 80);
 
@@ -213,6 +218,7 @@ struct CollectiveMainloopFwdSm80 {
         int const* const seqused_k = nullptr;
         int const* const leftpad_k = nullptr;
         int const* const seqlens_rotary = nullptr;
+        QKSkipMaskArgs const qk_skip_mask_args;
     };
 
     // Device side kernel params
@@ -259,6 +265,7 @@ struct CollectiveMainloopFwdSm80 {
         int const* const seqused_k = nullptr;
         int const* const leftpad_k = nullptr;
         int const* const seqlens_rotary = nullptr;
+        QKSkipMaskArgs const qk_skip_mask_args;
     };
 
     static Params
@@ -301,7 +308,8 @@ struct CollectiveMainloopFwdSm80 {
                 !Split ? 1 : args.num_splits,
                 args.kv_batch_idx,
                 args.cu_seqlens_q, args.cu_seqlens_k, args.cu_seqlens_k_new,
-                args.seqused_q, args.seqused_k, args.leftpad_k, args.seqlens_rotary};
+                args.seqused_q, args.seqused_k, args.leftpad_k, args.seqlens_rotary,
+                args.qk_skip_mask_args};
     }
 
     template <typename SharedStorage, typename FrgTensorO, typename Softmax>
@@ -583,6 +591,8 @@ struct CollectiveMainloopFwdSm80 {
 
         clear(tOrO);
 
+        // fwd_step: process one n_block tile (QK^T, softmax, PV)
+        // When Is_skipable, also performs skip detection and records to skip_writer
         auto fwd_step = [&](int const n_block, auto mask_fn, auto is_first_iter_type, auto check_inf_type) {
             static constexpr bool Is_first_iter = decltype(is_first_iter_type)::value;
             static constexpr bool Check_inf = decltype(check_inf_type)::value;
@@ -620,35 +630,249 @@ struct CollectiveMainloopFwdSm80 {
             smem_pipe_read = smem_pipe_read < kStages - 1 ? smem_pipe_read + 1 : 0;
         };
 
-        auto first_iter_mask_fn = [&](auto& tSrS, int n_block) { mask.template apply<true /*Seqlenk_mask*/, Is_causal, Is_local>(tSrS, m_block, n_block); };
-        fwd_step(n_block, first_iter_mask_fn, cute::true_type{} /*is_first_iter*/, cute::true_type{} /*check_inf*/);
-        --n_block;
-        if constexpr (Is_causal || Is_local) { // Separate iterations with causal or local masking
-            auto mask_fn = [&](auto& tSrS, int n_block) { mask.template apply<false /*Seqlenk_mask*/, Is_causal, Is_local>(tSrS, m_block, n_block); };
-            int const n_block_min_causal_local_mask = BlockMN_t::get_n_block_min_causal_local_mask(
-                seqlen_info, m_block, n_block_min, params.window_size_right,
+        // fwd_step_skip: same as fwd_step but with skip detection for SM80.
+        // Uses single-stage loading (no pipeline overlap across skip list ranges).
+        // Returns per-warp skip decision via shared memory coordination.
+        auto fwd_step_skip = [&](int const cur_n_block, int const next_n_block, bool const has_next,
+                                 auto mask_fn, auto is_first_iter_type, auto check_inf_type,
+                                 flash::SkipListWriter<Phase == false, HasMustDoList> &skip_writer) {
+            static constexpr bool Is_first_iter = decltype(is_first_iter_type)::value;
+            static constexpr bool Check_inf = decltype(check_inf_type)::value;
+            Tensor tSrS = partition_fragment_C(tiled_mma, select<0, 1>(TileShape_MNK{}));
+            clear(tSrS);
+
+            // Wait for K to be ready
+            flash::cp_async_wait<0>();
+            __syncthreads();
+
+            // Load V for current tile while computing QK^T
+            // Use runtime check for Seqlenk_mask since skip list iteration order
+            // doesn't guarantee first iteration is the last block
+            auto load_V_now = [&] {
+                if (cur_n_block == n_block_max - 1) {
+                    load_V(cur_n_block, 0, cute::true_type{} /*Seqlenk_mask*/);
+                } else {
+                    load_V(cur_n_block, 0, cute::false_type{} /*Seqlenk_mask*/);
+                }
+                cute::cp_async_fence();
+            };
+
+            Tensor tSrQ_cur = cute::conditional_return<Q_in_regs>(tSrQ, thr_mma.partition_fragment_A(sQ));
+            Tensor tSrK = thr_mma.partition_fragment_B(sK(_, _, _0{}));
+            flash::gemm_sm80<Q_in_regs>(
+                tSrS, tSrQ_cur, tSrK, tSsQ, tSsK(_, _, _, 0),
+                tiled_mma, smem_tiled_copy_Q, smem_tiled_copy_K, smem_thr_copy_Q, smem_thr_copy_K, load_V_now
+            );
+
+            scoremod_premask_fn(tSrS);
+            mask_fn(tSrS, cur_n_block);
+
+            // Skip detection: get scores_scale AND per-warp skip flag
+            bool warp_skip;
+            Tensor scores_scale = softmax.template max_get_scale_with_skip<kBlockM, TiledMma, Is_first_iter, Check_inf>(
+                tSrS, params.qk_skip_mask_args.thr, m_block, warp_skip);
+
+            // Cross-warp skip coordination via shared memory
+            int const warp_idx = thread_idx / 32;
+            // Initialize flag to 1 (skip), then atomicAnd with each warp's decision
+            if (thread_idx == 0) { shared_storage.skip_flag_sm80 = 1; }
+            __syncthreads();
+            if (thread_idx % 32 == 0) {
+                atomicAnd(&shared_storage.skip_flag_sm80, int(warp_skip));
+            }
+            __syncthreads();
+            bool const tile_skip = shared_storage.skip_flag_sm80;
+
+            // Record skip decision for next timestep
+            if (thread_idx == 0) {
+                skip_writer.record_transition(tile_skip, cur_n_block);
+            }
+
+            softmax.template online_softmax</*Is_first=*/Is_first_iter, Check_inf>(tSrS);
+            if constexpr (Is_FP8) { flash::permute_Cregs_fp8(tSrS); }
+            Tensor tOrP_acc = make_tensor(tSrS.data(), flash::convert_layout_acc_Aregs<TiledMma>(tSrS.layout()));
+            Tensor tOrP = make_tensor_like<Element>(tOrP_acc);
+            convert_type_out(tOrP_acc, tOrP);
+            if constexpr (!Is_first_iter) { softmax.rescale_o(tOrO, scores_scale); }
+
+            // Wait for V, then PV
+            flash::cp_async_wait<0>();
+            __syncthreads();
+            Tensor tOrV = thr_mma.partition_fragment_B(sVt(_, _, _0{}));
+            flash::gemm_rs_sm80(tOrO, tOrP, tOrV, tOsVt(_, _, _, 0), tiled_mma, smem_tiled_copy_V, smem_thr_copy_V);
+
+            // Preload K for next tile if available
+            if (has_next) {
+                bool const next_needs_seqlenk_mask = (next_n_block == n_block_max - 1);
+                if (next_needs_seqlenk_mask) {
+                    load_K(next_n_block, 0, cute::true_type{} /*Seqlenk_mask*/);
+                } else {
+                    load_K(next_n_block, 0, cute::false_type{} /*Seqlenk_mask*/);
+                }
+                cute::cp_async_fence();
+            }
+        };
+
+        if constexpr (!Is_skipable) {
+            // ============================================================
+            // Original non-skip code path (unchanged)
+            // ============================================================
+            auto first_iter_mask_fn = [&](auto& tSrS, int n_block) { mask.template apply<true /*Seqlenk_mask*/, Is_causal, Is_local>(tSrS, m_block, n_block); };
+            fwd_step(n_block, first_iter_mask_fn, cute::true_type{} /*is_first_iter*/, cute::true_type{} /*check_inf*/);
+            --n_block;
+            if constexpr (Is_causal || Is_local) { // Separate iterations with causal or local masking
+                auto mask_fn = [&](auto& tSrS, int n_block) { mask.template apply<false /*Seqlenk_mask*/, Is_causal, Is_local>(tSrS, m_block, n_block); };
+                int const n_block_min_causal_local_mask = BlockMN_t::get_n_block_min_causal_local_mask(
+                    seqlen_info, m_block, n_block_min, params.window_size_right,
+                    params.attention_chunk_divmod, params.qhead_per_khead_divmod);
+                #pragma unroll 1
+                for (; n_block >= n_block_min_causal_local_mask; --n_block) {
+                    fwd_step(n_block, mask_fn, cute::false_type{} /*is_first_iter*/, cute::true_type{} /*check_inf*/);
+                }
+            }
+            int const n_block_min_before_local_mask = BlockMN_t::get_n_block_min_before_local_mask(
+                seqlen_info, m_block, n_block_min, params.window_size_left,
                 params.attention_chunk_divmod, params.qhead_per_khead_divmod);
+            auto no_mask_fn = [](auto& tSrS, int n_block) { };
             #pragma unroll 1
-            for (; n_block >= n_block_min_causal_local_mask; --n_block) {
-                fwd_step(n_block, mask_fn, cute::false_type{} /*is_first_iter*/, cute::true_type{} /*check_inf*/);
+            for (; n_block >= n_block_min_before_local_mask; --n_block) {
+                fwd_step(n_block, no_mask_fn, cute::false_type{} /*is_first_iter*/, cute::false_type{} /*check_inf*/);
+            }
+            // Separate masking iterations on the left for local attention
+            if constexpr (Is_local) {
+                auto local_mask_fn = [&](auto& tSrS, int n_block) { mask.template apply<false /*Seqlenk_mask*/, false /*Causal_mask*/, Is_local>(tSrS, m_block, n_block); };
+                #pragma unroll 1
+                for (; n_block >= n_block_min; --n_block) {
+                    fwd_step(n_block, local_mask_fn, cute::false_type{} /*is_first_iter*/, cute::bool_constant<Is_local>{} /*check_inf*/);
+                }
+            }
+        } else {
+            // ============================================================
+            // Skip list iteration (LiteAttention SM80 port)
+            // Uses SkipListReader to iterate only over non-skipped ranges.
+            // Uses single-stage pipeline within each range.
+            // Detects skips and writes to SkipListWriter for next timestep.
+            // ============================================================
+            flash::SkipListReader<ReverseSkipList, Phase> skip_reader;
+            flash::SkipListWriter<Phase == false, HasMustDoList> skip_writer;
+
+            // Initialize skip list reader/writer
+            skip_reader.template init<TileShape_MNK>(params, bidb, bidh, m_block);
+            skip_writer.template init<TileShape_MNK>(params, bidb, bidh, m_block);
+
+            // Build a flat list of n_blocks to process from skip list ranges.
+            // The skip list reader gives us non-skipped ranges as [start, end) pairs.
+            // When Phase=true (step=+1): iterate start..end-1 forward within each range.
+            // When Phase=false (step=-1): iterate end-1..start backward within each range.
+            // The list reading order is controlled by Reverse (ReverseSkipList), while
+            // the iteration direction within ranges is controlled by step (from Phase).
+            static constexpr int step = Phase ? 1 : -1;
+            bool is_first_iter = true;
+            bool has_tiles = true;
+
+            // Helper: get the first n_block to process within a range.
+            // For Reverse=True reader, start_idx/end_idx are already adjusted by step:
+            //   Phase=True:  start_idx = low bound, end_idx = high bound (iterate forward)
+            //   Phase=False: start_idx = high bound, end_idx = low bound (iterate backward)
+            // In both cases, we start at start_idx.
+            auto range_first = [](int start, int /*end*/) {
+                return start;
+            };
+
+            // Start with the first range
+            n_block = range_first(skip_reader.start_idx, skip_reader.end_idx);
+
+            // Load first K tile
+            load_K(n_block, 0, cute::true_type{} /*Seqlenk_mask*/);
+            cute::cp_async_fence();
+
+            // Deferred range-end: must record AFTER fwd_step_skip processes the
+            // current tile's skip decision, otherwise the range-end marker goes
+            // into the writer before the tile's transition record.
+            bool pending_range_end = false;
+            int pending_range_end_idx = 0;
+
+            while (has_tiles) {
+                // Process tiles within current range
+                while (true) {
+                    // Check if we're at the last tile in the current range
+                    bool at_range_end;
+                    if constexpr (Phase) {
+                        // Forward: at end when next would be >= end_idx
+                        at_range_end = (n_block + 1 >= skip_reader.end_idx);
+                    } else {
+                        // Backward: at end when next would be <= end_idx (lower bound)
+                        at_range_end = (n_block - 1 <= skip_reader.end_idx);
+                    }
+
+                    // Determine next tile
+                    int next_n_block;
+                    bool has_next;
+                    if (!at_range_end) {
+                        next_n_block = n_block + step;
+                        has_next = true;
+                    } else {
+                        // End of current range - check for more ranges
+                        if (skip_reader.has_more()) {
+                            // Defer range end until after fwd_step_skip
+                            pending_range_end = true;
+                            pending_range_end_idx = skip_reader.end_idx;
+                            skip_reader.load_range();
+                            skip_reader.advance();
+                            next_n_block = range_first(skip_reader.start_idx, skip_reader.end_idx);
+                            has_next = true;
+                        } else {
+                            has_next = false;
+                            next_n_block = 0; // unused
+                        }
+                    }
+
+                    // Smart masking: single lambda with lightweight runtime branch.
+                    // Only applies seqlenk mask on the last K block; applies causal/local
+                    // mask only when those modes are active (compile-time eliminated otherwise).
+                    // This avoids multiple fwd_step_skip instantiations that bloat icache.
+                    auto mask_fn = [&](auto& tSrS, int nb) {
+                        if (nb >= n_block_max - 1) {
+                            mask.template apply<true /*Seqlenk_mask*/, Is_causal, Is_local>(tSrS, m_block, nb);
+                        } else if constexpr (Is_causal || Is_local) {
+                            mask.template apply<false /*Seqlenk_mask*/, Is_causal, Is_local>(tSrS, m_block, nb);
+                        }
+                        // Non-causal inner tiles: no masking (empty body, compiled away)
+                    };
+
+                    if (is_first_iter) {
+                        fwd_step_skip(n_block, next_n_block, has_next,
+                                      mask_fn, cute::true_type{}, cute::true_type{}, skip_writer);
+                        is_first_iter = false;
+                    } else {
+                        fwd_step_skip(n_block, next_n_block, has_next,
+                                      mask_fn, cute::false_type{},
+                                      cute::bool_constant<Is_causal || Is_local>{}, skip_writer);
+                    }
+
+                    // Now record the deferred range end (after fwd_step_skip has
+                    // recorded the current tile's skip transition)
+                    if (pending_range_end && thread_idx == 0) {
+                        skip_writer.record_range_end(false, pending_range_end_idx);
+                        pending_range_end = false;
+                    }
+
+                    if (!has_next) {
+                        has_tiles = false;
+                        break;
+                    }
+
+                    n_block = next_n_block;
+                }
+            }
+
+            // Close the last range and finalize skip writer
+            if (thread_idx == 0) {
+                skip_writer.record_range_end(false, skip_reader.end_idx);
+                skip_writer.finalize();
             }
         }
-        int const n_block_min_before_local_mask = BlockMN_t::get_n_block_min_before_local_mask(
-            seqlen_info, m_block, n_block_min, params.window_size_left,
-            params.attention_chunk_divmod, params.qhead_per_khead_divmod);
-        auto no_mask_fn = [](auto& tSrS, int n_block) { };
-        #pragma unroll 1
-        for (; n_block >= n_block_min_before_local_mask; --n_block) {
-            fwd_step(n_block, no_mask_fn, cute::false_type{} /*is_first_iter*/, cute::false_type{} /*check_inf*/);
-        }
-        // Separate masking iterations on the left for local attention
-        if constexpr (Is_local) {
-            auto local_mask_fn = [&](auto& tSrS, int n_block) { mask.template apply<false /*Seqlenk_mask*/, false /*Causal_mask*/, Is_local>(tSrS, m_block, n_block); };
-            #pragma unroll 1
-            for (; n_block >= n_block_min; --n_block) {
-                fwd_step(n_block, local_mask_fn, cute::false_type{} /*is_first_iter*/, cute::bool_constant<Is_local>{} /*check_inf*/);
-            }
-        }
+
         float const v_descale = !Is_FP8 || params.ptr_v_descale == nullptr ? 1.0f : params.ptr_v_descale[bidb * get<0>(params.stride_v_descale) + bidh_kv * get<1>(params.stride_v_descale)];
         Tensor scores_scale = softmax.finalize(v_descale);
         softmax.rescale_o(tOrO, scores_scale);

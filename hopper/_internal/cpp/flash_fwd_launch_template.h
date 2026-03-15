@@ -134,7 +134,8 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream)
             HasMustDoList>,      // 0
         // SM80-89 mainloop: Traditional warp-level cooperation with manual shared memory management
         flash::CollectiveMainloopFwdSm80<kNWarps, kStages, Q_in_regs, TileShape_MNK, kHeadDimV, Element, float, cutlass::arch::Sm80,
-                                         Is_causal, Is_local, Has_softcap, Varlen, PagedKVNonTMA, AppendKV, PackGQA, Split>>;
+                                         Is_causal, Is_local, Has_softcap, Varlen, PagedKVNonTMA, AppendKV, PackGQA, Split,
+                                         Is_skipable, ReverseSkipList, Phase, HasMustDoList>>;
 
     // Collective epilogue handles output writing and accumulation using CuTe's tensor operations
     // CollectiveEpilogueFwd<tuple<C<128>, C<128>, C<176>>, tuple<C<1>, C<1>, C<1>>, bfloat16_t, Sm90, 256, 0, 0, 0, 0>,
@@ -207,82 +208,114 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream)
             make_stride(params.v_row_stride, _1{}, params.v_head_stride, !is_varlen_k ? params.v_batch_stride : 0),
             // Column-major V layout: (head_dim, seqlen, num_heads, batch) strides
             make_stride(_1{}, params.v_dim_stride, params.v_head_stride, !is_varlen_k ? params.v_batch_stride : 0));
-    // Construct mainloop arguments using CuTe's tensor abstraction
-    // CuTe tensor arguments combine data pointers with shape and stride information
-    typename CollectiveMainloop::Arguments mainloop_args{
-        // ptr_Q
-        static_cast<Element const *>(params.q_ptr),
-        // shape_Q
-        {seqlen_q, params.d, params.h, batch_q}, // shape_Q: CuTe shape for Q tensor (seqlen, head_dim, num_heads, batch)
-        // stride_Q
-        {params.q_row_stride, _1{}, params.q_head_stride, !is_varlen_q ? params.q_batch_stride : 0}, // stride_Q: CuTe stride pattern
-        // ptr_K
-        static_cast<Element *>(params.k_ptr),
-        // shape_K
-        // shape_K: Handle paged KV cache vs. regular tensor layout
-        {!params.page_table ? (!is_varlen_k ? params.seqlen_k : params.total_k) : params.page_size,
-         params.d, params.h_k, !params.page_table ? batch_k : params.num_pages}, // CuTe shape for K tensor
-        // stride_K
-        {params.k_row_stride, _1{}, params.k_head_stride, !is_varlen_k ? params.k_batch_stride : 0}, // stride_K: CuTe stride pattern
-        // ptr_V
-        static_cast<ElementV *>(params.v_ptr),
-        // headdim_v
-        params.dv, // headdim_v: V tensor head dimension (can differ from Q/K)
-        // stride_V
-        v_strides, // stride_V: CuTe stride pattern constructed above
-        // ptr_K_new
-        static_cast<Element const *>(params.knew_ptr),
-        // shape_K_new
-        {!is_varlen_k_new ? params.seqlen_knew : params.total_knew, params.d, params.h_k, !is_varlen_k_new ? params.b : 1}, // shape_K_new: CuTe shape for new K tensor (KV cache append)
-        // stride_K_new
-        {params.knew_row_stride, _1{}, params.knew_head_stride, !is_varlen_k_new ? params.knew_batch_stride : 0}, // stride_K_new: CuTe stride pattern
-        // ptr_V_new
-        static_cast<ElementV const *>(params.vnew_ptr),
-        // stride_V_new
-        {params.vnew_row_stride, _1{}, params.vnew_head_stride, !is_varlen_k_new ? params.vnew_batch_stride : 0}, // stride_V_new: CuTe stride pattern for new V tensor
-        // ptr_Qv
-        static_cast<Element const *>(params.qv_ptr),
-        // stride_Qv
-        {params.qv_row_stride, _1{}, params.qv_head_stride, !is_varlen_q ? params.qv_batch_stride : 0}, // stride_Qv: CuTe stride for fused QV tensor
-        static_cast<Element const *>(params.rotary_cos_ptr),
-        {params.seqlen_k, params.rotary_dim / 2}, // shape_rotary: CuTe shape for rotary embeddings, the seqlen shape doesn't matter
-        {params.rotary_dim / 2, _1{}},            // stride_rotary_cos: CuTe stride pattern for cosine values
-        static_cast<Element const *>(params.rotary_sin_ptr),
-        {params.rotary_dim / 2, _1{}}, // stride_rotary_sin: CuTe stride pattern for sine values
-        params.is_rotary_interleaved,  // RoPE interleaving pattern flag
-        params.page_table,             // Paged KV cache page table pointer
-        // shape_page_table: CuTe shape for page table (batch, num_pages)
-        // if page_size is not set, avoid dividing by zero
-        {params.kv_batch_idx ? params.b_k : params.b, !params.page_table ? 0 : params.seqlen_k / params.page_size},
-        {params.page_table_batch_stride, _1{}}, // stride_page_table: CuTe stride pattern for page table
-        params.scale_softmax,                   // Softmax scaling factor
-        // FP8 descaling pointers for quantized tensors
-        params.q_descale_ptr,
-        params.k_descale_ptr,
-        params.v_descale_ptr,
-        // CuTe stride patterns for FP8 descaling tensors
-        {params.q_descale_batch_stride, params.q_descale_head_stride}, // Q descale strides (FP8)
-        {params.k_descale_batch_stride, params.k_descale_head_stride}, // K descale strides (FP8)
-        {params.v_descale_batch_stride, params.v_descale_head_stride}, // V descale strides
-        // INT8 descale strides (batch, head, block)
-        {params.q_descale_batch_stride, params.q_descale_head_stride, params.q_descale_block_stride}, // Q descale strides (INT8)
-        {params.k_descale_batch_stride, params.k_descale_head_stride, params.k_descale_block_stride}, // K descale strides (INT8)
-        params.window_size_left,
-        params.window_size_right,
-        params.attention_chunk, // Local attention window parameters
-        params.softcap,         // Softmax capping value to prevent attention saturation
-        params.num_splits,      // Split-K parallelization factor
-        params.kv_batch_idx,    // GQA batch indexing array
-        // Variable length sequence metadata arrays
-        params.cu_seqlens_q,
-        params.cu_seqlens_k,
-        params.cu_seqlens_knew, // Cumulative sequence lengths
-        params.seqused_q,
-        params.seqused_k, // Actual sequence lengths used (for padding)
-        params.leftpad_k,
-        params.seqlens_rotary, // Left padding for K and rotary position lengths
-        params.qk_skip_mask_args,
+    // Construct mainloop arguments - SM90 and SM80 have different Arguments structs
+    auto make_mainloop_args = [&]() -> typename CollectiveMainloop::Arguments {
+        if constexpr (Arch >= 90) {
+            return {
+                static_cast<Element const *>(params.q_ptr),
+                {seqlen_q, params.d, params.h, batch_q},
+                {params.q_row_stride, _1{}, params.q_head_stride, !is_varlen_q ? params.q_batch_stride : 0},
+                static_cast<Element *>(params.k_ptr),
+                {!params.page_table ? (!is_varlen_k ? params.seqlen_k : params.total_k) : params.page_size,
+                 params.d, params.h_k, !params.page_table ? batch_k : params.num_pages},
+                {params.k_row_stride, _1{}, params.k_head_stride, !is_varlen_k ? params.k_batch_stride : 0},
+                static_cast<ElementV *>(params.v_ptr),
+                params.dv,
+                v_strides,
+                static_cast<Element const *>(params.knew_ptr),
+                {!is_varlen_k_new ? params.seqlen_knew : params.total_knew, params.d, params.h_k, !is_varlen_k_new ? params.b : 1},
+                {params.knew_row_stride, _1{}, params.knew_head_stride, !is_varlen_k_new ? params.knew_batch_stride : 0},
+                static_cast<ElementV const *>(params.vnew_ptr),
+                {params.vnew_row_stride, _1{}, params.vnew_head_stride, !is_varlen_k_new ? params.vnew_batch_stride : 0},
+                static_cast<Element const *>(params.qv_ptr),
+                {params.qv_row_stride, _1{}, params.qv_head_stride, !is_varlen_q ? params.qv_batch_stride : 0},
+                static_cast<Element const *>(params.rotary_cos_ptr),
+                {params.seqlen_k, params.rotary_dim / 2},
+                {params.rotary_dim / 2, _1{}},
+                static_cast<Element const *>(params.rotary_sin_ptr),
+                {params.rotary_dim / 2, _1{}},
+                params.is_rotary_interleaved,
+                params.page_table,
+                {params.kv_batch_idx ? params.b_k : params.b, !params.page_table ? 0 : params.seqlen_k / params.page_size},
+                {params.page_table_batch_stride, _1{}},
+                params.scale_softmax,
+                params.q_descale_ptr,
+                params.k_descale_ptr,
+                params.v_descale_ptr,
+                {params.q_descale_batch_stride, params.q_descale_head_stride},
+                {params.k_descale_batch_stride, params.k_descale_head_stride},
+                {params.v_descale_batch_stride, params.v_descale_head_stride},
+                {params.q_descale_batch_stride, params.q_descale_head_stride, params.q_descale_block_stride},
+                {params.k_descale_batch_stride, params.k_descale_head_stride, params.k_descale_block_stride},
+                params.window_size_left,
+                params.window_size_right,
+                params.attention_chunk,
+                params.softcap,
+                params.num_splits,
+                params.kv_batch_idx,
+                params.cu_seqlens_q,
+                params.cu_seqlens_k,
+                params.cu_seqlens_knew,
+                params.seqused_q,
+                params.seqused_k,
+                params.leftpad_k,
+                params.seqlens_rotary,
+                params.qk_skip_mask_args,
+            };
+        } else {
+            return {
+                static_cast<Element const *>(params.q_ptr),
+                {seqlen_q, params.d, params.h, batch_q},
+                {params.q_row_stride, _1{}, params.q_head_stride, !is_varlen_q ? params.q_batch_stride : 0},
+                static_cast<Element *>(params.k_ptr),
+                {!params.page_table ? (!is_varlen_k ? params.seqlen_k : params.total_k) : params.page_size,
+                 params.d, params.h_k, !params.page_table ? batch_k : params.num_pages},
+                {params.k_row_stride, _1{}, params.k_head_stride, !is_varlen_k ? params.k_batch_stride : 0},
+                static_cast<ElementV *>(params.v_ptr),
+                params.dv,
+                v_strides,
+                static_cast<Element const *>(params.knew_ptr),
+                {!is_varlen_k_new ? params.seqlen_knew : params.total_knew, params.d, params.h_k, !is_varlen_k_new ? params.b : 1},
+                {params.knew_row_stride, _1{}, params.knew_head_stride, !is_varlen_k_new ? params.knew_batch_stride : 0},
+                static_cast<ElementV const *>(params.vnew_ptr),
+                {params.vnew_row_stride, _1{}, params.vnew_head_stride, !is_varlen_k_new ? params.vnew_batch_stride : 0},
+                static_cast<Element const *>(params.qv_ptr),
+                {params.qv_row_stride, _1{}, params.qv_head_stride, !is_varlen_q ? params.qv_batch_stride : 0},
+                static_cast<Element const *>(params.rotary_cos_ptr),
+                {params.seqlen_k, params.rotary_dim / 2},
+                {params.rotary_dim / 2, _1{}},
+                static_cast<Element const *>(params.rotary_sin_ptr),
+                {params.rotary_dim / 2, _1{}},
+                params.is_rotary_interleaved,
+                params.page_table,
+                {params.kv_batch_idx ? params.b_k : params.b, !params.page_table ? 0 : params.seqlen_k / params.page_size},
+                {params.page_table_batch_stride, _1{}},
+                params.scale_softmax,
+                params.q_descale_ptr,
+                params.k_descale_ptr,
+                params.v_descale_ptr,
+                // SM80 StrideDescale is 2-element only (no INT8 3-element strides)
+                {params.q_descale_batch_stride, params.q_descale_head_stride},
+                {params.k_descale_batch_stride, params.k_descale_head_stride},
+                {params.v_descale_batch_stride, params.v_descale_head_stride},
+                params.window_size_left,
+                params.window_size_right,
+                params.attention_chunk,
+                params.softcap,
+                params.num_splits,
+                params.kv_batch_idx,
+                params.cu_seqlens_q,
+                params.cu_seqlens_k,
+                params.cu_seqlens_knew,
+                params.seqused_q,
+                params.seqused_k,
+                params.leftpad_k,
+                params.seqlens_rotary,
+                params.qk_skip_mask_args,
+            };
+        }
     };
+    typename CollectiveMainloop::Arguments mainloop_args = make_mainloop_args();
     // Construct epilogue arguments for output tensor handling using CuTe abstractions
     typename CollectiveEpilogue::Arguments epilogue_args{
         static_cast<ElementOut *>(params.o_ptr),

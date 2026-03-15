@@ -140,6 +140,7 @@ def _flash_attn_backward(
     softcap=0.0,
     deterministic=False,
     sm_margin=0,
+    block_mask=None,
 ):
     # dq, dk, dv are allocated by us so they should already be contiguous
     dout, q, k, v, out = [maybe_contiguous(x) for x in (dout, q, k, v, out)]
@@ -166,6 +167,7 @@ def _flash_attn_backward(
         softcap,
         deterministic,
         sm_margin,
+        block_mask,
     )
     return dq, dk, dv, softmax_d
 
@@ -326,6 +328,7 @@ class FlashAttnFunc(torch.autograd.Function):
         return_softmax_lse=False,
         reverse_skip_list=False,
         phase=False,
+        bwd_block_mask=None,
     ):
         if softmax_scale is None:
             softmax_scale = (q.shape[-1] + (qv.shape[-1] if qv is not None else 0)) ** (
@@ -382,6 +385,8 @@ class FlashAttnFunc(torch.autograd.Function):
         ctx.softcap = softcap
         ctx.deterministic = deterministic
         ctx.sm_margin = sm_margin
+        # Store backward block mask if provided (for tile skipping)
+        ctx.bwd_block_mask = bwd_block_mask
         if return_softmax_lse:
             return out, softmax_lse
         else:
@@ -392,6 +397,8 @@ class FlashAttnFunc(torch.autograd.Function):
         q, k, v, out, softmax_lse = ctx.saved_tensors
         assert ctx.attention_chunk == 0, "FA3 backward does not support attention_chunk"
         dq, dk, dv = torch.empty_like(q), torch.empty_like(k), torch.empty_like(v)
+        # Get backward block mask if set on ctx
+        block_mask = getattr(ctx, 'bwd_block_mask', None)
         _flash_attn_backward(
             dout,
             q,
@@ -414,6 +421,7 @@ class FlashAttnFunc(torch.autograd.Function):
             ctx.softcap,
             ctx.deterministic,
             ctx.sm_margin,
+            block_mask=block_mask,
         )
         dq = dq[..., : q.shape[-1]]  # We could have padded the head dimension
         dk = dk[..., : k.shape[-1]]
@@ -422,20 +430,28 @@ class FlashAttnFunc(torch.autograd.Function):
             dq,
             dk,
             dv,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
+            None,  # softmax_scale
+            None,  # causal
+            None,  # qv
+            None,  # q_descale
+            None,  # k_descale
+            None,  # v_descale
+            None,  # use_int8
+            None,  # window_size
+            None,  # attention_chunk
+            None,  # softcap
+            None,  # num_splits
+            None,  # pack_gqa
+            None,  # deterministic
+            None,  # sm_margin
+            None,  # attn_read_list
+            None,  # attn_must_do_list
+            None,  # attn_write_list
+            None,  # thr
+            None,  # return_softmax_lse
+            None,  # reverse_skip_list
+            None,  # phase
+            None,  # bwd_block_mask
         )
 
 
@@ -679,6 +695,7 @@ def flash_attn_func(
     return_softmax_lse=False,
     reverse_skip_list=False,
     phase=False,
+    bwd_block_mask=None,
 ):
     """dropout_p should be set to 0.0 during evaluation
     Supports multi-query and grouped-query attention (MQA/GQA) by passing in KV with fewer heads
@@ -751,6 +768,7 @@ def flash_attn_func(
         return_softmax_lse,
         reverse_skip_list,
         phase,
+        bwd_block_mask,
     )
 
 

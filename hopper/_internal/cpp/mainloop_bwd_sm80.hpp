@@ -306,6 +306,10 @@ struct CollectiveMainloopBwdSm80 {
         int const* const cu_seqlens_k = nullptr;
         int const* const seqused_q = nullptr;
         int const* const seqused_k = nullptr;
+        // Block sparsity mask for backward tile skipping
+        uint32_t const* const ptr_block_mask = nullptr;
+        int const num_mask_words = 0;  // words per (bh, n) entry; 0 = no mask
+        int const num_col_tiles = 0;
     };
 
     // Device side kernel params
@@ -341,6 +345,10 @@ struct CollectiveMainloopBwdSm80 {
         int const *const cu_seqlens_k = nullptr;
         int const *const seqused_q = nullptr;
         int const *const seqused_k = nullptr;
+        // Block sparsity mask for backward tile skipping
+        uint32_t const* const ptr_block_mask = nullptr;
+        int const num_mask_words = 0;
+        int const num_col_tiles = 0;
     };
 
     static Params
@@ -370,7 +378,28 @@ struct CollectiveMainloopBwdSm80 {
                 args.window_size_left, args.window_size_right, attention_chunk_divmod,
                 !Has_softcap ? 0.f : args.softmax_scale / args.softcap_val,
                 args.num_batch, args.dq_semaphore,
-                args.cu_seqlens_q, args.cu_seqlens_k, args.seqused_q, args.seqused_k};
+                args.cu_seqlens_q, args.cu_seqlens_k, args.seqused_q, args.seqused_k,
+                args.ptr_block_mask, args.num_mask_words, args.num_col_tiles};
+    }
+
+
+    // ── Backward block-sparsity: inline bitmask check ──────────────────────
+    // Layout: ptr_block_mask[(bidb*H + bidh) * num_col_tiles * num_mask_words + n_block * num_mask_words + word]
+    // Bit (m % 32) of word (m / 32) is set iff Q-block m is active for this n_block.
+    CUTLASS_DEVICE static bool
+    is_m_block_active(Params const& params, int bidb, int bidh, int n_block, int m_block) {
+        if (params.ptr_block_mask == nullptr) return true;  // no mask = all active
+        int num_heads = get<2>(params.shape_Q);
+        int num_words = params.num_mask_words;
+        int num_cols  = params.num_col_tiles;
+        int word_idx  = m_block >> 5;   // m_block / 32
+        int bit_idx   = m_block & 31;   // m_block % 32
+        if (word_idx >= num_words) return true;  // safety: out of mask range = active
+        uint32_t const* base = params.ptr_block_mask
+            + (int64_t(bidb) * num_heads + bidh) * num_cols * num_words
+            + n_block * num_words;
+        uint32_t word = __ldg(base + word_idx);  // read-only L2 cache path
+        return (word >> bit_idx) & 1u;
     }
 
     template <typename SharedStorage, typename FrgTensordKV>
@@ -880,6 +909,7 @@ struct CollectiveMainloopBwdSm80 {
             int const m_block_masking_max = ((n_block + 1) * kBlockN - 1 + seqlen_q - seqlen_k - params.window_size_right) / kBlockM + 1;
             CUTLASS_PRAGMA_NO_UNROLL
             for (; m_block < std::min(m_block_max, m_block_masking_max); ++m_block) {
+                if (!is_m_block_active(params, bidb, bidh, n_block, m_block)) continue;
                 bwd_step(m_block, mask_fn);
             }
         }
@@ -892,6 +922,7 @@ struct CollectiveMainloopBwdSm80 {
         auto mask_fn = [&](auto& tSrS, int m_block) { mask.template apply<true /*Seqlenk_mask*/, Is_causal && !SeparateMaskingIterations, Is_local && !SeparateMaskingIterations>(tSrS, m_block, n_block); };
         CUTLASS_PRAGMA_NO_UNROLL
         for (; m_block < m_block_max_before_local_mask; ++m_block) {
+            if (!is_m_block_active(params, bidb, bidh, n_block, m_block)) continue;
             bwd_step(m_block, mask_fn);
         }
 
@@ -899,6 +930,7 @@ struct CollectiveMainloopBwdSm80 {
             auto mask_fn = [&](auto& tSrS, int m_block) { mask.template apply<true /*Seqlenk_mask*/, false /*Causal_mask*/, Is_local>(tSrS, m_block, n_block); };
             CUTLASS_PRAGMA_NO_UNROLL
             for (; m_block < m_block_max; ++m_block) {
+                if (!is_m_block_active(params, bidb, bidh, n_block, m_block)) continue;
                 bwd_step(m_block, mask_fn);
             }
         }

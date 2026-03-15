@@ -198,16 +198,17 @@ namespace flash
             }
         }
 
-        // Record the end of a range (force transition to skipping)
+        // Record the end of a range (force transition to skipping).
+        // If we were computing (is_skipping=false), write the end marker.
         __device__
-        void record_range_end(bool skip, int end_idx)
+        void record_range_end(bool /* skip */, int end_idx)
         {
-            is_skipping = true;
-            if (skip != is_skipping)
+            if (!is_skipping)
             {
                 list_ptr[write_idx] = end_idx;
                 write_idx++;
             }
+            is_skipping = true;
         }
 
         // Finalize the skip list by writing the count

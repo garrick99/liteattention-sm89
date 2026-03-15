@@ -320,6 +320,10 @@ struct CollectiveMainloopBwdSm90 {
         int const* const cu_seqlens_k = nullptr;
         int const* const seqused_q = nullptr;
         int const* const seqused_k = nullptr;
+        // Block sparsity mask (unused on SM90 in this path, but needed for interface compat)
+        uint32_t const* const ptr_block_mask = nullptr;
+        int const num_mask_words = 0;
+        int const num_col_tiles = 0;
     };
 
     // Device side kernel params
@@ -350,6 +354,9 @@ struct CollectiveMainloopBwdSm90 {
         int const* const cu_seqlens_k = nullptr;
         int const* const seqused_q = nullptr;
         int const* const seqused_k = nullptr;
+        uint32_t const* const ptr_block_mask = nullptr;
+        int const num_mask_words = 0;
+        int const num_col_tiles = 0;
     };
 
     static Params
@@ -406,7 +413,8 @@ struct CollectiveMainloopBwdSm90 {
                 args.window_size_left, args.window_size_right, attention_chunk_divmod,
                 !Has_softcap ? 0.f : args.softmax_scale / args.softcap_val,
                 args.num_batch, args.dq_semaphore,
-                args.cu_seqlens_q, args.cu_seqlens_k, args.seqused_q, args.seqused_k};
+                args.cu_seqlens_q, args.cu_seqlens_k, args.seqused_q, args.seqused_k,
+                args.ptr_block_mask, args.num_mask_words, args.num_col_tiles};
     }
 
     /// Issue Tma Descriptor Prefetch -- ideally from a single thread for best performance

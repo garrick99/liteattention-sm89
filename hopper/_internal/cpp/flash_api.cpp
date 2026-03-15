@@ -1490,7 +1490,8 @@
      int64_t window_size_right,
      double softcap,
      bool deterministic,
-     int64_t sm_margin
+     int64_t sm_margin,
+     std::optional<at::Tensor> block_mask_
  ) {
  
      #ifdef FLASHATTENTION_DISABLE_BACKWARD
@@ -1753,6 +1754,16 @@
      TORCH_CHECK(params.softcap == 0.0, "This flash attention build does not support tanh softcapping.");
      #endif
  
+     // Set block sparsity mask if provided
+     if (block_mask_.has_value()) {
+         auto block_mask = block_mask_.value();
+         TORCH_CHECK(block_mask.dtype() == torch::kInt32, "block_mask must be int32");
+         TORCH_CHECK(block_mask.is_cuda(), "block_mask must be on CUDA");
+         params.block_mask_ptr = block_mask.data_ptr();
+         // block_mask shape: [B, H, N, num_words]
+         params.block_mask_num_words = block_mask.size(-1);
+     }
+
      if (total_q > 0 && total_k > 0 && num_heads_k > 0) {
          auto stream = at::cuda::getCurrentCUDAStream().stream();
          run_mha_bwd(params, stream);
@@ -1884,7 +1895,20 @@
              static_cast<int64_t>(MmaPV_is_RS), static_cast<int64_t>(IntraWGOverlap)};
  }
  
- TORCH_LIBRARY(lite_attention, m) {
+ // Wrapper function to expose tile_size_fwd_sm8x to Python
+// Returns [kBlockM, kBlockN, kNWarps, kStages, Q_in_regs]
+std::vector<int64_t> get_tile_size_fwd_sm8x(
+        bool sm86_or_89, int64_t headdim, int64_t headdim_v, bool is_causal, bool is_local,
+        int64_t element_size, bool paged_kv, bool varlen_and_split, bool softcap, bool append_kv) {
+    auto [kBlockM, kBlockN, kNWarps, kStages, Q_in_regs] = tile_size_fwd_sm8x(
+        sm86_or_89, static_cast<int>(headdim), static_cast<int>(headdim_v), is_causal, is_local,
+        static_cast<int>(element_size), paged_kv, varlen_and_split, softcap, append_kv);
+    return {static_cast<int64_t>(kBlockM), static_cast<int64_t>(kBlockN),
+            static_cast<int64_t>(kNWarps), static_cast<int64_t>(kStages),
+            static_cast<int64_t>(Q_in_regs)};
+}
+
+TORCH_LIBRARY(lite_attention, m) {
      m.def("fwd("
          "Tensor q,"
          "Tensor k,"
@@ -1950,7 +1974,8 @@
          "int window_size_right = -1,"
          "float softcap = 0.0,"
          "bool deterministic = False,"
-         "int sm_margin = 0) -> (Tensor(dq!), Tensor(dk!), Tensor(dv!), Tensor, Tensor, Tensor, Tensor, Tensor)");
+         "int sm_margin = 0,"
+         "Tensor? block_mask = None) -> (Tensor(dq!), Tensor(dk!), Tensor(dv!), Tensor, Tensor, Tensor, Tensor, Tensor)");
      m.def("fwd_combine("
          "Tensor out_partial,"
          "Tensor lse_partial,"
@@ -1992,6 +2017,17 @@
          "bool softcap = False,"
          "bool is_skipable = False,"
          "bool is_int8 = False) -> int[]", &get_tile_size_fwd_sm90);
+     m.def("get_tile_size_fwd_sm8x("
+         "bool sm86_or_89,"
+         "int headdim,"
+         "int headdim_v,"
+         "bool is_causal,"
+         "bool is_local,"
+         "int element_size = 2,"
+         "bool paged_kv = False,"
+         "bool varlen_and_split = False,"
+         "bool softcap = False,"
+         "bool append_kv = False) -> int[]", &get_tile_size_fwd_sm8x);
  }
  
  TORCH_LIBRARY_IMPL(lite_attention, CUDA, m) {

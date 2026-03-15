@@ -237,6 +237,10 @@ struct Flash_bwd_params : public Flash_fwd_params
 
     bool deterministic;
     index_t dq_accum_split_stride;
+
+    // Block sparsity mask for backward tile skipping
+    void const* __restrict__ block_mask_ptr = nullptr;
+    int block_mask_num_words = 0;  // int32 words per (bh, n_block) entry
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////

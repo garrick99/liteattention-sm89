@@ -346,14 +346,14 @@ class LiteAttention(nn.Module, ConfigurableModule):
         for computation. Different head dimensions and data types require different
         tile sizes for optimal performance.
 
-        This function directly calls the C++ `tile_size_fwd_sm90()` function from
-        `tile_size.h` to ensure consistency between Python and CUDA kernel tile sizes.
+        Automatically selects between SM90 and SM8x tile size functions based on
+        the current GPU's compute capability.
 
         Args:
             head_dim (int): Dimension of each attention head
             dtype (torch.dtype): Data type of the tensors (fp16, bf16, fp32, int8)
             v_colmajor (bool, optional): Whether value tensor is column-major. Defaults to False.
-            is_int8 (bool, optional): Whether using int8 quantization. Defaults to False.
+            is_skipable (bool, optional): Whether skip list is active. Defaults to True.
 
         Returns:
             tuple[int, int]: (kBlockM, kBlockN) where:
@@ -362,22 +362,20 @@ class LiteAttention(nn.Module, ConfigurableModule):
         """
         is_int8 = dtype == torch.int8
         element_size = dtype.itemsize
-        # Call C++ tile_size_fwd_sm90 function
-        # Arguments: headdim, headdim_v, is_causal, is_local, element_size,
-        #            v_colmajor, paged_kv_non_TMA, softcap, is_skipable, is_int8
-        # Returns: [kBlockM, kBlockN, MmaPV_is_RS, IntraWGOverlap]
-        result = _lite_attention_ops.get_tile_size_fwd_sm90(
-            head_dim,  # headdim
-            head_dim,  # headdim_v (same as headdim for standard attention)
-            False,  # is_causal (not relevant for skipable case)
-            False,  # is_local
-            element_size,  # element_size (2 for fp16/bf16, 4 for fp32)
-            v_colmajor,  # v_colmajor
-            False,  # paged_kv_non_TMA
-            False,  # softcap
-            is_skipable,  # is_skipable
-            is_int8,  # is_int8
-        )
+        arch = torch.cuda.get_device_capability()
+        sm_version = arch[0] * 10 + arch[1]
+
+        if sm_version >= 90:
+            result = _lite_attention_ops.get_tile_size_fwd_sm90(
+                head_dim, head_dim, False, False, element_size,
+                v_colmajor, False, False, is_skipable, is_int8,
+            )
+        else:
+            sm86_or_89 = sm_version in (86, 89)
+            result = _lite_attention_ops.get_tile_size_fwd_sm8x(
+                sm86_or_89, head_dim, head_dim, False, False, element_size,
+                False, False, False, False,
+            )
         kBlockM, kBlockN = result[0], result[1]
         return kBlockM, kBlockN
 
@@ -479,6 +477,11 @@ class LiteAttention(nn.Module, ConfigurableModule):
                 ktiles
             )
 
+            # Adjust boundaries by -1 to match the skip list format convention.
+            # The reader adds +step (±1) when loading ranges, so raw values must
+            # be offset by -1.  The normal "compute all" init stores [ktiles-1, -1]
+            # for the same reason.
+            tile_indices = [x - 1 for x in tile_indices]
             tile_indices = [len(tile_indices)] + list(reversed(tile_indices))
             skip_list[0, :, :, :, : len(tile_indices)] = torch.tensor(
                 tile_indices, dtype=torch.int16, device=device

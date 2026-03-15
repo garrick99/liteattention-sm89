@@ -387,6 +387,71 @@ namespace flash
             return scores_scale;
         };
 
+        // SM80 version of skip detection. Returns scores_scale and sets skip_out
+        // to true if this warp thinks the tile can be skipped.
+        // skip_out is per-warp; caller must AND across all warps.
+        template <int kBlockM, typename TiledMma, bool const Is_first, bool const Check_inf = false, typename Tensor0>
+        __forceinline__ __device__ TensorT max_get_scale_with_skip(
+            Tensor0 &acc_s,
+            const float threshold,
+            const int m_block,
+            bool &skip_out)
+        {
+            Tensor scores = make_tensor(acc_s.data(), flash::convert_layout_acc_rowcol(acc_s.layout()));
+            static_assert(CUTE_STATIC_V(size<0>(scores)) == kNRows);
+            TensorT scores_scale;
+            if constexpr (Is_first)
+            {
+                flash::template reduce_max</*zero_init=*/true>(scores, row_max);
+                cute::fill(scores_scale, 1.f);
+                // First iter: can't skip (no previous max to compare against)
+                skip_out = false;
+            }
+            else
+            {
+                Tensor scores_max_prev = make_fragment_like(row_max);
+                cute::copy(row_max, scores_max_prev);
+
+                Tensor scores_max_local = make_fragment_like(row_max);
+                flash::template reduce_max</*zero_init=*/true>(scores, scores_max_local);
+
+                // Compute thread_row_offset and seqlenq_row_limit following mask.h pattern
+                auto thread_mma = TiledMma{}.get_thread_slice(thread_idx);
+                auto thread0_mma = TiledMma{}.get_thread_slice(_0{});
+                Tensor cS = cute::make_identity_tensor(Shape<Int<kBlockM>, Int<kBlockM>>{});
+                Tensor tScS = thread_mma.partition_C(cS);
+                Tensor t0ScS = thread0_mma.partition_C(cS);
+                Tensor tScS_rowcol = make_tensor(tScS.data(), flash::convert_layout_acc_rowcol(tScS.layout()));
+                Tensor t0ScS_rowcol = make_tensor(t0ScS.data(), flash::convert_layout_acc_rowcol(t0ScS.layout()));
+                int const thread_row_offset = get<0>(tScS_rowcol(_0{}, _0{}));
+                int const seqlenq_row_limit = seqlen_q - m_block * kBlockM - thread_row_offset;
+
+                bool do_qk = false;
+#pragma unroll
+                for (int mi = 0; mi < size(row_max); ++mi)
+                {
+                    const bool row_not_out_of_bounds = !(int(get<0>(t0ScS_rowcol(mi, _0{}))) >= seqlenq_row_limit);
+
+                    row_max(mi) = max(row_max(mi), scores_max_local(mi));
+                    float cur;
+                    if constexpr (Check_inf) {
+                        cur = row_max(mi) == -INFINITY ? 0.0f : row_max(mi);
+                    } else {
+                        cur = row_max(mi);
+                    }
+                    float prev = scores_max_prev(mi);
+                    scores_scale(mi) = exp2f((prev - cur) * softmax_scale_log2);
+                    row_sum(mi) *= scores_scale(mi);
+
+                    bool cond = ((scores_max_local(mi) - prev) * softmax_scale_log2) > threshold;
+                    do_qk |= cond & row_not_out_of_bounds;
+                }
+
+                skip_out = !__any_sync(0xffffffffu, do_qk);
+            }
+            return scores_scale;
+        };
+
         // TONY: acc_s is Q times K for one tile
         template <bool const Is_first, bool const Check_inf = false, typename Tensor0>
         __forceinline__ __device__ TensorT max_get_scale(Tensor0 &acc_s)

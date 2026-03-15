@@ -131,7 +131,10 @@ void run_flash_bwd(Flash_bwd_params &params, cudaStream_t stream) {
         params.b,
         params.dq_semaphore,
         params.cu_seqlens_q, params.cu_seqlens_k,
-        params.seqused_q, params.seqused_k
+        params.seqused_q, params.seqused_k,
+        static_cast<uint32_t const*>(params.block_mask_ptr),
+        params.block_mask_num_words,
+        (params.block_mask_ptr != nullptr) ? cute::ceil_div(seqlen_k, kBlockN) : 0
     };
     // The case work with GQA is ugly but idk how to fix it.
     typename CollectiveEpilogue::Arguments epilogue_args {

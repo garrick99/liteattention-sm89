@@ -14,6 +14,7 @@
 #include "seqlen.h"
 #include "utils.h"
 #include "softmax.h"
+#include "skip_list.h"
 
 namespace flash {
 
@@ -39,6 +40,10 @@ public:
     static constexpr bool AppendKV = CollectiveMainloop::AppendKV;
     static constexpr bool PackGQA = CollectiveMainloop::PackGQA;
     static constexpr int NumProducerThreads = CollectiveMainloop::NumProducerThreads;
+    static constexpr bool Is_skipable = CollectiveMainloop::Is_skipable;
+    static constexpr bool ReverseSkipList = CollectiveMainloop::ReverseSkipList;
+    static constexpr bool Phase = CollectiveMainloop::Phase;
+    static constexpr bool HasMustDoList = CollectiveMainloop::HasMustDoList;
     using SeqlenInfo_t = typename CollectiveMainloop::SeqlenInfo_t;
 
     // Mainloop derived types
@@ -83,6 +88,9 @@ public:
 
         alignas(16) typename TileScheduler::SharedStorage smem_scheduler;
 
+        // Shared memory for cross-warp skip decision coordination (SM80)
+        // Each warp writes its skip decision, then all warps AND the results
+        alignas(4) int skip_flag_sm80;
     };
 
     static constexpr int SharedStorageSize = sizeof(SharedStorage);
@@ -178,7 +186,7 @@ public:
                 float const k_descale = params.mainloop.ptr_k_descale == nullptr ? 1.0f : params.mainloop.ptr_k_descale[bidb * get<0>(params.mainloop.stride_k_descale) + bidh_kv * get<1>(params.mainloop.stride_k_descale)];
                 softmax_scale_log2 *= q_descale * k_descale;
             }
-            flash::Softmax<2 * (2 * kBlockM / NumThreads), /*Max_offset=*/!Is_FP8 ? 0 : 8> softmax(softmax_scale_log2);
+            flash::Softmax<2 * (2 * kBlockM / NumThreads), /*Max_offset=*/!Is_FP8 ? 0 : 8> softmax(softmax_scale_log2, get<0>(params.mainloop.shape_Q), threadIdx.x);
 
             SeqlenInfo_t seqlen_info{
                 bidb,

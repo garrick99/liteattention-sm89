@@ -1,8 +1,8 @@
 # LiteAttention SM89 Port & Performance Report
 
 **Date:** 2026-03-15
-**Author:** Garrick
-**Hardware:** NVIDIA RTX 4090 (SM89), i9-14900KF, 32GB RAM
+**Author:** garrick99
+**Hardware:** NVIDIA RTX 4090 (SM89), 64-core CPU, 32GB RAM
 **Codebase:** LiteAttention v0.4.0 + SM89 patches
 **Target:** Video model inference — outperform FA4
 
@@ -191,7 +191,7 @@ The backward dominates at 70% of total training time. Backward tile skipping dir
 
 ### Training
 4. **Automatic backward bitmask generation** — currently the bitmask is provided manually. Need to generate it from the forward's skip list or tile_stats automatically. Two approaches: (a) convert LiteAttention's write_list to bitmask, (b) add BackLite's tile_stats to the forward kernel.
-5. **Pre-allocated persistent buffers** — skip lists, bitmasks, and tile_stats should be allocated once and reused across steps. Zero-alloc hot path like kraken-stark's ProverCache.
+5. **Pre-allocated persistent buffers** — skip lists, bitmasks, and tile_stats should be allocated once and reused across steps. Zero-alloc hot path like VortexSTARK's ProverCache.
 
 ### Bug fixes (upstream)
 6. **6 SM80 skip list bugs** from the original code review (all fixed locally, not yet upstreamed)
@@ -216,7 +216,7 @@ python setup.py build_ext --inplace
 pip install -e . --no-build-isolation --no-deps
 ```
 
-Build time: ~20-30 minutes with `MAX_JOBS=4` on i9-14900KF.
+Build time: ~20-30 minutes with `MAX_JOBS=4` on a high-core-count CPU.
 
 ---
 

@@ -1,7 +1,7 @@
 # BackLite Code Review
 
 **Date:** 2026-03-15
-**Reviewer:** Garrick (with Claude)
+**Reviewer:** garrick99
 **Codebase:** moonmath-ai/BackLite (1,062 commits)
 **Hardware tested on:** None (SM90 Hopper required; RTX 4090 is SM89)
 **Repository:** https://github.com/moonmath-ai/BackLite

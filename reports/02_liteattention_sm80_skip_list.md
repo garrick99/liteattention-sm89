@@ -152,5 +152,5 @@ Fwd  3: compute= 81.2%, cos_sim=0.99999613
 
 - LiteAttention v0.4.0
 - RTX 4090 (SM89), CUDA 12.4
-- i9-14900KF, Ubuntu
+- High-core-count CPU, Ubuntu
 - bf16, hdim=128

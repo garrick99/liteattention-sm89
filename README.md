@@ -13,7 +13,7 @@
 LiteAttention is now fully operational on SM89 (RTX 4090) with both forward skip list and a new backward tile skipping capability. On video inference workloads with temporal redundancy:
 
 - **6.6x faster per-step** than baseline FA3 (134us vs 889us)
-- **~7.5x faster** than FA4 on H100 (~1000us reference)
+- **~7.5x faster** than FA4 on H100 (~1000us reference, cross-hardware comparison)
 - **Output quality:** cos_sim 0.989 at threshold=-1.0 with 2% inter-step noise
 - **Convergence:** Skip list settles in 2 steps
 - **Backward tile skipping (new):** 2.95x kernel speedup at 87.5% skip rate
@@ -76,7 +76,7 @@ Near-diagonal attention pattern (K ≈ Q + noise), 2% Gaussian perturbation per 
 
 **Settled per-step: 134 us = 6.6x faster than baseline FA3.**
 
-Reference: FA4 on H100 is ~1000us for this config. **LiteAttention on RTX 4090 at 134us is ~7.5x faster than FA4 on H100.**
+Reference: FA4 on H100 is ~1000us for this config. **LiteAttention on RTX 4090 at 134us is ~7.5x faster than FA4 on H100.** Note: this is a cross-hardware comparison (RTX 4090 vs H100) — the RTX 4090 is a consumer GPU at a fraction of H100's cost and power draw.
 
 ### Threshold Sweep
 
